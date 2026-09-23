@@ -53,15 +53,21 @@ class RobotController(Node):
         # Document HERE why you chose this path and this representation.
         # That reasoning is a large part of what we are evaluating.
 
-        # Wall centered at (6, 0) & blocks y from -3 to 3
-        # Pole at (4, 2.5) on the north, so go around the south end
-        # Timed commands (forward m/s, turn rad/s, s)
+        # wall at (6, 0), size 0.5 x 6 -> covers y in [-3, 3], x in [5.75, 6.25]
+        # pole at (4, 2.5), north side, so go around the south end
+        # robot is 2m long, 1m wide. chassis starts near (0.5, 0)
+        # timed commands (forward m/s, turn rad/s, s) -- open loop, world is static
+        speed = 0.5
+        turn = 0.4
+        turn_90 = math.pi / (2.0 * turn)          # exact 90 deg: (pi/2) / rate
+        south_m = 3.0 + 1.0 + 0.5                 # wall half-width + half robot length + gap
+        past_m = (6.25 + 1.0 + 1.25) - 0.5        # past wall face + half length + margin - start x
         self.path = [
-            (0.0, -0.4, 3.927),  # -90 deg, face south (-y). +turn would face the pole
-            (0.5, 0.0, 9.0),     # 4.5 m, past the south end of the wall
-            (0.0, 0.4, 3.927),   # +90 deg, face +x again
-            (0.5, 0.0, 16.0),    # 8 m, past the wall at x=6
-            (0.0, 0.0, 1e9),     # hold stop. 1e9 s so we never leave this segment
+            (0.0, -turn, turn_90),    # -90 deg, face south (-y). +turn would face the pole
+            (speed, 0.0, south_m / speed),  # 4.5 m, y ~ -4.5, south of the wall
+            (0.0, turn, turn_90),     # +90 deg, face +x again
+            (speed, 0.0, past_m / speed),   # 8 m, chassis past x=6.25
+            (0.0, 0.0, 1e9),          # hold stop. 1e9 s so we never leave this segment
         ]
         self.path_index = 0
         self.segment_elapsed = 0.0
@@ -88,6 +94,8 @@ class RobotController(Node):
         self.vel_x = 0.0        # integrated speed, m/s
         self.vel_y = 0.0
         self.last_imu_t = None  # need 2 imu stamps before we have a dt
+        self.last_ax = None     # last world-frame accel, for trapezoid
+        self.last_ay = None
 
         # ---- TASK 3: lidar in, filtered obstacles out ----------------------
         # The lidar has a single vertical sample, so this cloud is one flat
@@ -152,18 +160,30 @@ class RobotController(Node):
 
         q = msg.orientation
         ax, ay = msg.linear_acceleration.x, msg.linear_acceleration.y  # robot frame. skip z, that's gravity
-        yaw = math.atan2(  # heading from the quaternion
-            2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        ax_w = math.cos(yaw) * ax - math.sin(yaw) * ay  # rotate into odom frame so it matches truth_xy
-        ay_w = math.sin(yaw) * ax + math.cos(yaw) * ay
+        # zyx yaw: these two are already sin(yaw), cos(yaw). skip atan2 + sin/cos
+        sin_y = 2.0 * (q.w * q.z + q.x * q.y)
+        cos_y = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        n = math.hypot(sin_y, cos_y)
+        if n > 0.0:
+            sin_y /= n
+            cos_y /= n
+        ax_w = cos_y * ax - sin_y * ay  # rotate accel into odom frame
+        ay_w = sin_y * ax + cos_y * ay
 
-        self.vel_x += ax_w * dt  # accel * time = speed
-        self.vel_y += ay_w * dt
-        self.est_x += self.vel_x * dt  # speed * time = position
-        self.est_y += self.vel_y * dt
+        # trapezoid: use avg of last and this sample. imu is only 1 hz so this matters
+        if self.last_ax is None:
+            self.last_ax, self.last_ay = ax_w, ay_w
+            return
+        vx_new = self.vel_x + 0.5 * (self.last_ax + ax_w) * dt
+        vy_new = self.vel_y + 0.5 * (self.last_ay + ay_w) * dt
+        self.est_x += 0.5 * (self.vel_x + vx_new) * dt
+        self.est_y += 0.5 * (self.vel_y + vy_new) * dt
+        self.vel_x, self.vel_y = vx_new, vy_new
+        self.last_ax, self.last_ay = ax_w, ay_w
 
-        delta = math.hypot(self.est_x - self.truth_xy[0], self.est_y - self.truth_xy[1])
+        dx = self.est_x - self.truth_xy[0]
+        dy = self.est_y - self.truth_xy[1]
+        delta = math.hypot(dx, dy)  # sqrt(dx^2 + dy^2)
         if delta > self.error_thresh:  # integrating accel twice drifts, so this will fire
             out = Float64()
             out.data = delta
